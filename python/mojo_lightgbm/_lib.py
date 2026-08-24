@@ -19,7 +19,11 @@ _SIGNATURES = {
     "mlgb_histogram_subtract_inplace": ([I] * 7, None),
     "mlgb_histogram_totals": ([I] * 4, None),
     "mlgb_best_split": ([I] * 7 + [F, F, I, I, F, F, F, F], None),
+    "mlgb_best_split_pair": (
+        [I] * 10 + [F, F, I, F, F, I, I, F, F, F, F], None
+    ),
     "mlgb_partition": ([I] * 8, I),
+    "mlgb_partition_histogram_left": ([I] * 14, I),
     "mlgb_regression_gradients": ([I] * 5, None),
     "mlgb_binary_gradients": ([I] * 5, None),
     "mlgb_predict": ([I] * 11 + [F], None),

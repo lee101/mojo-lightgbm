@@ -86,15 +86,17 @@ after warm-up. Ratios above 1 mean Mojo is faster.
 
 | Benchmark | mojo-lightgbm | upstream LightGBM (1 thread) | Upstream / Mojo |
 |---|---:|---:|---:|
-| LGBMRegressor.fit (5k x 12, 20 trees) | 82.89 ms | 45.80 ms | 0.55x |
-| Booster.predict (100k x 12, 20 trees) | 105.04 ms | 131.19 ms | 1.25x |
-| LGBMClassifier.fit (5k x 12, 20 trees) | 54.52 ms | 46.11 ms | 0.85x |
+| LGBMRegressor.fit (5k x 12, 20 trees) | 38.34 ms | 25.53 ms | 0.67x |
+| Booster.predict (100k x 12, 20 trees) | 80.85 ms | 97.85 ms | 1.21x |
+| LGBMClassifier.fit (5k x 12, 20 trees) | 39.41 ms | 29.94 ms | 0.76x |
 
 Upstream LightGBM remains faster at training. Its mature C++ trainer has years
-of optimization and performs tree orchestration in C++. This port now builds
-only the smaller child histogram after a split and obtains its sibling by SIMD
-subtraction from the parent histogram. The flat Mojo prediction kernel wins on
-this ensemble and batch size.
+of optimization and performs tree orchestration in C++. This port fuses stable
+partitioning with construction of one child histogram, obtains its sibling by
+SIMD subtraction from the parent histogram, and scans both child split
+candidates through one FFI call. Histogram and partition workspaces are reused
+across boosting rounds. The flat Mojo prediction kernel wins on this ensemble
+and batch size.
 
 These are real measurements from the included benchmark, not projected
 results. Different CPUs, tree shapes, thread counts, and dataset sizes will
@@ -122,7 +124,10 @@ addresses as 64-bit integers; the single Mojo compilation unit reconstructs
 `@export` functions. Python owns every allocation, and Mojo neither retains nor
 frees caller memory.
 
-No GPU path is included.
+No GPU path is included. Histogram construction and tree traversal are
+low-arithmetic-intensity, irregular memory-access kernels, while the vectorized
+gradient kernels are too small a share of training to repay device transfer and
+launch overhead. None of the measured training targets justified GPU execution.
 
 ## Development
 

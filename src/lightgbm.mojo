@@ -288,6 +288,44 @@ def mlgb_best_split(
     result[5] = Float64(best_left_count)
 
 
+@export("mlgb_best_split_pair")
+def mlgb_best_split_pair(
+    hist0_grad_addr: Int,
+    hist0_hess_addr: Int,
+    hist0_count_addr: Int,
+    hist1_grad_addr: Int,
+    hist1_hess_addr: Int,
+    hist1_count_addr: Int,
+    ncuts_addr: Int,
+    result_addr: Int,
+    n_features: Int,
+    max_bin: Int,
+    total0_grad: Float64,
+    total0_hess: Float64,
+    total0_count: Int,
+    total1_grad: Float64,
+    total1_hess: Float64,
+    total1_count: Int,
+    min_child_samples: Int,
+    min_child_weight: Float64,
+    min_split_gain: Float64,
+    reg_alpha: Float64,
+    reg_lambda: Float64,
+) abi("C"):
+    mlgb_best_split(
+        hist0_grad_addr, hist0_hess_addr, hist0_count_addr, ncuts_addr,
+        result_addr, n_features, max_bin, total0_grad, total0_hess,
+        total0_count, min_child_samples, min_child_weight, min_split_gain,
+        reg_alpha, reg_lambda,
+    )
+    mlgb_best_split(
+        hist1_grad_addr, hist1_hess_addr, hist1_count_addr, ncuts_addr,
+        result_addr + 6 * 8, n_features, max_bin, total1_grad, total1_hess,
+        total1_count, min_child_samples, min_child_weight, min_split_gain,
+        reg_alpha, reg_lambda,
+    )
+
+
 @export("mlgb_partition")
 def mlgb_partition(
     bins_addr: Int,
@@ -315,6 +353,76 @@ def mlgb_partition(
             nright += 1
     comptime W = simd_width_of[DType.int64]()
     var i = 0
+    while i + W <= nright:
+        joined.store(nleft + i, scratch.load[width=W](i))
+        i += W
+    while i < nright:
+        joined[nleft + i] = scratch[i]
+        i += 1
+    return nleft
+
+
+@export("mlgb_partition_histogram_left")
+def mlgb_partition_histogram_left(
+    bins_addr: Int,
+    indices_addr: Int,
+    grad_addr: Int,
+    hess_addr: Int,
+    joined_addr: Int,
+    scratch_addr: Int,
+    hist_grad_addr: Int,
+    hist_hess_addr: Int,
+    hist_count_addr: Int,
+    n_indices: Int,
+    n_features: Int,
+    max_bin: Int,
+    feature: Int,
+    threshold_bin: Int,
+) abi("C") -> Int:
+    var bins = ip(bins_addr)
+    var indices = ip(indices_addr)
+    var grad = fp(grad_addr)
+    var hess = fp(hess_addr)
+    var joined = ip(joined_addr)
+    var scratch = ip(scratch_addr)
+    var hist_grad = fp(hist_grad_addr)
+    var hist_hess = fp(hist_hess_addr)
+    var hist_count = ip(hist_count_addr)
+    var hist_size = n_features * max_bin
+    comptime W = simd_width_of[DType.float64]()
+    var i = 0
+    while i + W <= hist_size:
+        hist_grad.store(i, SIMD[DType.float64, W](0.0))
+        hist_hess.store(i, SIMD[DType.float64, W](0.0))
+        hist_count.store(i, SIMD[DType.int64, W](0))
+        i += W
+    while i < hist_size:
+        hist_grad[i] = 0.0
+        hist_hess[i] = 0.0
+        hist_count[i] = 0
+        i += 1
+
+    var nleft = 0
+    var nright = 0
+    for pos in range(n_indices):
+        var row = Int(indices[pos])
+        if Int(bins[row * n_features + feature]) <= threshold_bin:
+            joined[nleft] = Int64(row)
+            nleft += 1
+            var g = grad[row]
+            var h = hess[row]
+            for histogram_feature in range(n_features):
+                var bin_id = Int(
+                    bins[row * n_features + histogram_feature]
+                )
+                var slot = histogram_feature * max_bin + bin_id
+                hist_grad[slot] += g
+                hist_hess[slot] += h
+                hist_count[slot] += 1
+        else:
+            scratch[nright] = Int64(row)
+            nright += 1
+    i = 0
     while i + W <= nright:
         joined.store(nleft + i, scratch.load[width=W](i))
         i += W

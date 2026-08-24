@@ -152,9 +152,7 @@ def _histograms(
                     ),
                 )
             )
-        tuple(
-            _HISTOGRAM_EXECUTOR.map(_call_kernel, tasks)
-        )
+        tuple(_HISTOGRAM_EXECUTOR.map(_call_kernel, tasks))
         lib().mlgb_histogram_reduce(
             partial_addresses[0], partial_addresses[1], partial_addresses[2],
             target.grad_addr, target.hess_addr, target.count_addr,
@@ -200,6 +198,46 @@ class _Candidate:
     left_count: int
 
 
+@dataclass(slots=True)
+class _TreeWorkspace:
+    histograms: list[_Histograms]
+    partition: np.ndarray | None
+    partition_scratch: np.ndarray | None
+    partition_base: int
+    scratch_base: int
+    root_indices: np.ndarray
+    split_result: np.ndarray
+
+
+def _tree_workspace(n_rows, n_features, params):
+    workspace_leaves = min(
+        params["num_leaves"],
+        max(1, n_rows // max(params["min_child_samples"], 1)),
+    )
+    histograms = _histogram_workspace(
+        workspace_leaves, n_features, params["max_bin"]
+    )
+    if (workspace_leaves - 1) * n_rows <= 2_000_000:
+        partition = np.empty((workspace_leaves - 1, n_rows), dtype=np.int64)
+        partition_scratch = np.empty_like(partition)
+        partition_base = addr(partition)
+        scratch_base = addr(partition_scratch)
+    else:
+        partition = None
+        partition_scratch = None
+        partition_base = 0
+        scratch_base = 0
+    return _TreeWorkspace(
+        histograms,
+        partition,
+        partition_scratch,
+        partition_base,
+        scratch_base,
+        np.arange(n_rows, dtype=np.int64),
+        np.empty(12, dtype=np.float64),
+    )
+
+
 def _candidate_from_histograms(
     histograms,
     indices,
@@ -224,19 +262,52 @@ def _candidate_from_histograms(
         n_features, max_bin, total_grad, total_hess, len(indices), min_child_samples,
         min_child_weight, min_split_gain, reg_alpha, reg_lambda,
     )
-    if result[0] < 0:
+    return _candidate_from_result(
+        histograms, indices, total_grad, total_hess, result
+    )
+
+
+def _candidate_from_result(
+    histograms, indices, total_grad, total_hess, result, offset=0
+):
+    if result[offset] < 0:
         return None
     return _Candidate(
-        float(result[2]),
-        int(result[0]),
-        int(result[1]),
+        float(result[offset + 2]),
+        int(result[offset]),
+        int(result[offset + 1]),
         histograms,
         total_grad,
         total_hess,
         len(indices),
-        float(result[3]),
-        float(result[4]),
-        int(result[5]),
+        float(result[offset + 3]),
+        float(result[offset + 4]),
+        int(result[offset + 5]),
+    )
+
+
+def _candidate_pair_from_histograms(
+    histograms, indices, totals, ncuts, max_bin, min_child_samples,
+    min_child_weight, min_split_gain, reg_alpha, reg_lambda, result,
+    ncuts_address, result_address,
+):
+    first, second = histograms
+    (first_grad, first_hess), (second_grad, second_hess) = totals
+    lib().mlgb_best_split_pair(
+        first.grad_addr, first.hess_addr, first.count_addr,
+        second.grad_addr, second.hess_addr, second.count_addr,
+        ncuts_address, result_address, first.n_features, max_bin,
+        first_grad, first_hess, len(indices[0]),
+        second_grad, second_hess, len(indices[1]), min_child_samples,
+        min_child_weight, min_split_gain, reg_alpha, reg_lambda,
+    )
+    return (
+        _candidate_from_result(
+            first, indices[0], first_grad, first_hess, result, 0
+        ),
+        _candidate_from_result(
+            second, indices[1], second_grad, second_hess, result, 6
+        ),
     )
 
 
@@ -291,7 +362,41 @@ def _partition(
     return joined[:nleft], joined[nleft:]
 
 
-def _fit_tree(x, bins, cuts, ncuts, grad, hess, params):
+def _partition_histogram_left(
+    indices,
+    bins,
+    grad,
+    hess,
+    feature,
+    threshold_bin,
+    target,
+    input_addresses=None,
+    joined=None,
+    joined_address=None,
+    scratch=None,
+    scratch_address=None,
+):
+    if joined is None:
+        joined = np.empty(len(indices), dtype=np.int64)
+    if scratch is None:
+        scratch = np.empty(len(indices), dtype=np.int64)
+    if input_addresses is None:
+        bins_address, grad_address, hess_address = (
+            addr(bins), addr(grad), addr(hess)
+        )
+    else:
+        bins_address, grad_address, hess_address = input_addresses
+    nleft = lib().mlgb_partition_histogram_left(
+        bins_address, addr(indices), grad_address, hess_address,
+        addr(joined) if joined_address is None else joined_address,
+        addr(scratch) if scratch_address is None else scratch_address,
+        target.grad_addr, target.hess_addr, target.count_addr,
+        len(indices), bins.shape[1], target.max_bin, feature, threshold_bin,
+    )
+    return joined[:nleft], joined[nleft:]
+
+
+def _fit_tree(x, bins, cuts, ncuts, grad, hess, params, workspace=None):
     max_bin = params["max_bin"]
     num_leaves = params["num_leaves"]
     max_depth = params["max_depth"]
@@ -309,31 +414,20 @@ def _fit_tree(x, bins, cuts, ncuts, grad, hess, params):
     values = [0.0]
     leaf_ids = [0]
     gains = [0.0]
-    node_indices = [np.arange(len(x), dtype=np.int64)]
+    if workspace is None:
+        workspace = _tree_workspace(len(x), bins.shape[1], params)
+    node_indices = [workspace.root_indices]
     depths = [0]
-    split_result = np.empty(6, dtype=np.float64)
+    split_result = workspace.split_result
     input_addresses = (addr(bins), addr(grad), addr(hess))
     ncuts_address = addr(ncuts)
     result_address = addr(split_result)
-    workspace_leaves = min(
-        num_leaves, max(1, len(x) // max(min_child_samples, 1))
-    )
-    histogram_workspace = _histogram_workspace(
-        workspace_leaves, bins.shape[1], max_bin
-    )
+    histogram_workspace = workspace.histograms
     next_histogram = 1
-    if (workspace_leaves - 1) * len(x) <= 2_000_000:
-        partition_workspace = np.empty(
-            (workspace_leaves - 1, len(x)), dtype=np.int64
-        )
-        partition_scratch = np.empty_like(partition_workspace)
-        partition_base = addr(partition_workspace)
-        scratch_base = addr(partition_scratch)
-    else:
-        partition_workspace = None
-        partition_scratch = None
-        partition_base = 0
-        scratch_base = 0
+    partition_workspace = workspace.partition
+    partition_scratch = workspace.partition_scratch
+    partition_base = workspace.partition_base
+    scratch_base = workspace.scratch_base
     partition_slot = 0
     root_histograms = _histograms(
         node_indices[0], bins, grad, hess, max_bin, input_addresses,
@@ -360,17 +454,20 @@ def _fit_tree(x, bins, cuts, ncuts, grad, hess, params):
         feature = candidate.feature
         threshold_bin = candidate.threshold_bin
         indices = node_indices[node]
+        fused_histograms = histogram_workspace[next_histogram]
         if partition_workspace is None:
-            left_indices, right_indices = _partition(
-                indices, bins, feature, threshold_bin, input_addresses[0]
+            left_indices, right_indices = _partition_histogram_left(
+                indices, bins, grad, hess, feature, threshold_bin,
+                fused_histograms, input_addresses,
             )
         else:
             joined = partition_workspace[partition_slot, : len(indices)]
             scratch = partition_scratch[partition_slot, : len(indices)]
             joined_address = partition_base + partition_slot * len(x) * 8
             scratch_address = scratch_base + partition_slot * len(x) * 8
-            left_indices, right_indices = _partition(
-                indices, bins, feature, threshold_bin, input_addresses[0],
+            left_indices, right_indices = _partition_histogram_left(
+                indices, bins, grad, hess, feature, threshold_bin,
+                fused_histograms, input_addresses,
                 joined, joined_address, scratch, scratch_address,
             )
             partition_slot += 1
@@ -427,33 +524,48 @@ def _fit_tree(x, bins, cuts, ncuts, grad, hess, params):
 
         child_histograms = {}
         if len(eligible) == 2:
-            smaller = 0 if len(left_indices) <= len(right_indices) else 1
-            child_histograms[smaller] = _histograms(
-                child_indices_list[smaller], bins, grad, hess, max_bin,
-                input_addresses, histogram_workspace[next_histogram],
-            )
+            child_histograms[0] = fused_histograms
             next_histogram += 1
-            other = 1 - smaller
-            child_histograms[other] = _subtract_histograms(
-                candidate.histograms, child_histograms[smaller]
+            child_histograms[1] = _subtract_histograms(
+                candidate.histograms, child_histograms[0]
             )
         elif eligible:
             side = eligible[0]
-            child_histograms[side] = _histograms(
-                child_indices_list[side], bins, grad, hess, max_bin,
-                input_addresses, histogram_workspace[next_histogram],
-            )
+            child_histograms[side] = fused_histograms
+            if side == 1:
+                child_histograms[side] = _subtract_histograms(
+                    candidate.histograms, fused_histograms
+                )
             next_histogram += 1
 
-        for side in eligible:
-            child = left_node + side
-            child_grad, child_hess, _ = child_stats[side]
-            child_candidate = _candidate_from_histograms(
-                child_histograms[side], child_indices_list[side], ncuts, max_bin,
-                min_child_samples, min_child_weight, min_split_gain,
-                reg_alpha, reg_lambda, child_grad, child_hess, split_result,
+        if len(eligible) == 2:
+            child_candidates = _candidate_pair_from_histograms(
+                (child_histograms[0], child_histograms[1]),
+                child_indices_list,
+                (
+                    (child_stats[0][0], child_stats[0][1]),
+                    (child_stats[1][0], child_stats[1][1]),
+                ),
+                ncuts, max_bin, min_child_samples, min_child_weight,
+                min_split_gain, reg_alpha, reg_lambda, split_result,
                 ncuts_address, result_address,
             )
+        else:
+            child_candidates = []
+            for side in eligible:
+                child_grad, child_hess, _ = child_stats[side]
+                child_candidates.append(
+                    _candidate_from_histograms(
+                        child_histograms[side], child_indices_list[side],
+                        ncuts, max_bin, min_child_samples, min_child_weight,
+                        min_split_gain, reg_alpha, reg_lambda, child_grad,
+                        child_hess, split_result, ncuts_address,
+                        result_address,
+                    )
+                )
+
+        for side, child_candidate in zip(eligible, child_candidates):
+            child = left_node + side
             if child_candidate is not None:
                 heapq.heappush(
                     queue, (-child_candidate.gain, child, child_candidate)
@@ -583,10 +695,13 @@ def train(
         if objective == "regression"
         else lib().mlgb_binary_gradients
     )
+    tree_workspace = _tree_workspace(len(x), x.shape[1], cfg)
 
     for _ in range(num_boost_round):
         gradient_kernel(addr(raw), addr(y), addr(grad), addr(hess), len(x))
-        tree = _fit_tree(x, bins, cuts, ncuts, grad, hess, cfg)
+        tree = _fit_tree(
+            x, bins, cuts, ncuts, grad, hess, cfg, tree_workspace
+        )
         booster.trees.append(tree)
         booster._flat_cache = None
         lib().mlgb_predict_add(

@@ -5,8 +5,11 @@ from mojo_lightgbm._lib import addr, f64, i64, lib
 from mojo_lightgbm.engine import (
     _PARALLEL_HISTOGRAM_MIN_CELLS,
     _best_candidate,
+    _candidate_from_histograms,
+    _candidate_pair_from_histograms,
     _histograms,
     _partition,
+    _partition_histogram_left,
     _quantize,
 )
 
@@ -145,6 +148,48 @@ def test_best_split_matches_reference():
     assert chosen == pytest.approx(expected[0])
 
 
+def test_paired_best_split_matches_two_single_scans():
+    rng = np.random.default_rng(41)
+    bins = np.ascontiguousarray(
+        rng.integers(0, 7, size=(60, 5)), dtype=np.int64
+    )
+    grad = np.ascontiguousarray(rng.normal(size=60))
+    hess = np.ascontiguousarray(rng.uniform(0.1, 1.0, size=60))
+    indices = (
+        np.arange(0, 31, dtype=np.int64),
+        np.arange(31, 60, dtype=np.int64),
+    )
+    histograms = tuple(
+        _histograms(part, bins, grad, hess, 7) for part in indices
+    )
+    totals = tuple(
+        (float(np.sum(grad[part])), float(np.sum(hess[part])))
+        for part in indices
+    )
+    ncuts = np.full(5, 6, dtype=np.int64)
+    paired_result = np.empty(12, dtype=np.float64)
+    paired = _candidate_pair_from_histograms(
+        histograms, indices, totals, ncuts, 7, 2, 0.0, 0.0, 0.0, 1.0,
+        paired_result, addr(ncuts), addr(paired_result),
+    )
+    singles = []
+    for histogram, part, (total_grad, total_hess) in zip(
+        histograms, indices, totals
+    ):
+        result = np.empty(6, dtype=np.float64)
+        singles.append(
+            _candidate_from_histograms(
+                histogram, part, ncuts, 7, 2, 0.0, 0.0, 0.0, 1.0,
+                total_grad, total_hess, result,
+            )
+        )
+    for actual, expected in zip(paired, singles):
+        assert actual is not None and expected is not None
+        assert actual.gain == pytest.approx(expected.gain)
+        assert actual.feature == expected.feature
+        assert actual.threshold_bin == expected.threshold_bin
+
+
 def test_partition_preserves_all_indices():
     bins = np.ascontiguousarray([[0, 2], [2, 1], [1, 0], [3, 3]], dtype=np.int64)
     indices = np.array([3, 0, 2, 1], dtype=np.int64)
@@ -152,6 +197,30 @@ def test_partition_preserves_all_indices():
     assert np.array_equal(left, [0, 2])
     assert np.array_equal(right, [3, 1])
     assert np.array_equal(np.sort(np.r_[left, right]), np.arange(4))
+
+
+def test_fused_partition_histogram_matches_separate_kernels_with_simd_tail():
+    rng = np.random.default_rng(31)
+    bins = np.ascontiguousarray(
+        rng.integers(0, 7, size=(43, 5)), dtype=np.int64
+    )
+    indices = np.ascontiguousarray(rng.permutation(43)[:37], dtype=np.int64)
+    grad = np.ascontiguousarray(rng.normal(size=43))
+    hess = np.ascontiguousarray(rng.uniform(0.05, 1.0, size=43))
+    expected_left, expected_right = _partition(
+        indices, bins, feature=2, threshold_bin=3
+    )
+    target = _histograms(expected_left, bins, grad, hess, 7)
+    expected = tuple(array.copy() for array in target.owners)
+    actual = _histograms(indices[:0], bins, grad, hess, 7)
+    left, right = _partition_histogram_left(
+        indices, bins, grad, hess, 2, 3, actual
+    )
+    assert np.array_equal(left, expected_left)
+    assert np.array_equal(right, expected_right)
+    assert np.allclose(actual.owners[0], expected[0])
+    assert np.allclose(actual.owners[1], expected[1])
+    assert np.array_equal(actual.owners[2], expected[2])
 
 
 @pytest.mark.parametrize("binary", [False, True])
