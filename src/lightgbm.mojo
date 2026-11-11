@@ -126,9 +126,9 @@ def mlgb_histogram_reduce(
         var count_vector = SIMD[DType.int64, W](0)
         for partial in range(n_partials):
             var offset = partial * n + i
-            grad_vector += partial_grad.load[width=W](offset)
-            hess_vector += partial_hess.load[width=W](offset)
-            count_vector += partial_count.load[width=W](offset)
+            grad_vector += partial_grad.unsafe_load[width=W](offset)
+            hess_vector += partial_hess.unsafe_load[width=W](offset)
+            count_vector += partial_count.unsafe_load[width=W](offset)
         hist_grad.store(i, grad_vector)
         hist_hess.store(i, hess_vector)
         hist_count.store(i, count_vector)
@@ -169,15 +169,15 @@ def mlgb_histogram_subtract_inplace(
     while i + W <= n:
         parent_grad.store(
             i,
-            parent_grad.load[width=W](i) - child_grad.load[width=W](i),
+            parent_grad.unsafe_load[width=W](i) - child_grad.unsafe_load[width=W](i),
         )
         parent_hess.store(
             i,
-            parent_hess.load[width=W](i) - child_hess.load[width=W](i),
+            parent_hess.unsafe_load[width=W](i) - child_hess.unsafe_load[width=W](i),
         )
         parent_count.store(
             i,
-            parent_count.load[width=W](i) - child_count.load[width=W](i),
+            parent_count.unsafe_load[width=W](i) - child_count.unsafe_load[width=W](i),
         )
         i += W
     while i < n:
@@ -202,8 +202,8 @@ def mlgb_histogram_totals(
     var hess_vector = SIMD[DType.float64, W](0.0)
     var i = 0
     while i + W <= max_bin:
-        grad_vector += hist_grad.load[width=W](i)
-        hess_vector += hist_hess.load[width=W](i)
+        grad_vector += hist_grad.unsafe_load[width=W](i)
+        hess_vector += hist_hess.unsafe_load[width=W](i)
         i += W
     var total_grad = Float64(grad_vector.reduce_add())
     var total_hess = Float64(hess_vector.reduce_add())
@@ -354,7 +354,7 @@ def mlgb_partition(
     comptime W = simd_width_of[DType.int64]()
     var i = 0
     while i + W <= nright:
-        joined.store(nleft + i, scratch.load[width=W](i))
+        joined.store(nleft + i, scratch.unsafe_load[width=W](i))
         i += W
     while i < nright:
         joined[nleft + i] = scratch[i]
@@ -424,7 +424,7 @@ def mlgb_partition_histogram_left(
             nright += 1
     i = 0
     while i + W <= nright:
-        joined.store(nleft + i, scratch.load[width=W](i))
+        joined.store(nleft + i, scratch.unsafe_load[width=W](i))
         i += W
     while i < nright:
         joined[nleft + i] = scratch[i]
@@ -445,7 +445,7 @@ def mlgb_regression_gradients(
     while i + W <= n:
         grad.store(
             i,
-            raw.load[width=W](i) - label.load[width=W](i),
+            raw.unsafe_load[width=W](i) - label.unsafe_load[width=W](i),
         )
         hess.store(i, SIMD[DType.float64, W](1.0))
         i += W
@@ -466,10 +466,10 @@ def mlgb_binary_gradients(
     comptime W = simd_width_of[DType.float64]()
     var i = 0
     while i + W <= n:
-        var z = raw.load[width=W](i)
+        var z = raw.unsafe_load[width=W](i)
         var clipped = min(max(z, -709.0), 709.0)
         var probability = 1.0 / (1.0 + exp(-clipped))
-        grad.store(i, probability - label.load[width=W](i))
+        grad.store(i, probability - label.unsafe_load[width=W](i))
         hess.store(i, probability * (1.0 - probability))
         i += W
     while i < n:
